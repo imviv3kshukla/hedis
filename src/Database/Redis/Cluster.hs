@@ -41,6 +41,8 @@ import System.IO.Unsafe(unsafeInterleaveIO)
 
 import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
+import Data.Char(toLower)
+import Say(sayString)
 
 -- This module implements a clustered connection whilst maintaining
 -- compatibility with the original Hedis codebase. In particular it still
@@ -114,6 +116,9 @@ instance Exception UnsupportedClusterCommandException
 
 newtype CrossSlotException = CrossSlotException [[B.ByteString]] deriving (Show, Typeable)
 instance Exception CrossSlotException
+
+newtype CrossSlotException2 = CrossSlotException2 [B.ByteString] deriving (Show, Typeable)
+instance Exception CrossSlotException2
 
 data NoNodeException = NoNodeException  deriving (Show, Typeable)
 instance Exception NoNodeException
@@ -266,11 +271,28 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         replies <- requestNode nodeConn $ map rawRequest nodeRequests
         return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
     retry :: Int -> CompletedRequest -> IO CompletedRequest
-    retry retryCount (CompletedRequest index request thisReply) = do
-        retryReply <- head <$> retryBatch shardMapVar refreshShardmapAction conn retryCount [request] [thisReply]
+    retry retryCount resp@(CompletedRequest index request thisReply) = do
+        retryReply <- case thisReply of
+            (Error errString) | B.isPrefixOf "MOVED" errString -> do
+                shardMap <- hasLocked' "reading shard map in retry MOVED" $ readMVar shardMapVar
+                nodeConn <- nodeConnectionForCommand' conn shardMap (requestForResponse resp)
+                head <$> requestNode nodeConn [request]
+            (askingRedirection -> Just (host, port)) -> do
+                shardMap <- hasLocked' "reading shardmap in retry ASK" $ readMVar shardMapVar
+                let maybeAskNode = nodeConnWithHostAndPort shardMap conn host port
+                case maybeAskNode of
+                    Just askNode -> last <$> requestNode askNode [["ASKING"], requestForResponse resp]
+                    Nothing -> case retryCount of
+                        0 -> do
+                            _ <- refreshShardMapVar' "missing node in first retry of ASK"
+                            rawResponse <$> retry (retryCount + 1) resp
+                        _ -> throwIO $ MissingNodeException (requestForResponse resp)
+            _ -> return thisReply
         return (CompletedRequest index request retryReply)
     refreshShardMapVar :: IO ()
     refreshShardMapVar = hasLocked $ modifyMVar_ shardMapVar (const refreshShardmapAction)
+    refreshShardMapVar' :: String -> IO ()    
+    refreshShardMapVar' msg = hasLocked' msg $ modifyMVar_ shardMapVar (const refreshShardmapAction)
 
 -- Retry a batch of requests if any of the responses is a redirect instruction.
 -- If multiple requests are passed in they're assumed to be a MULTI..EXEC
@@ -422,11 +444,45 @@ nodeConnectionForCommand conn@(Connection nodeConns _ _ infoMap _) (ShardMap sha
                 Nothing -> throwIO $ MissingNodeException request
                 Just allNodes' -> return allNodes'
 
+nodeConnectionForCommand' :: Connection -> ShardMap -> [B.ByteString] -> IO NodeConnection
+nodeConnectionForCommand' (Connection nodeConns _ _ infoMap connReadOnly) (ShardMap shardMap) request = do
+    let mek = case request of
+          ("MULTI" : key : _) -> Just [key]
+          ("EXEC" : key : _) -> Just [key]
+          _ -> Nothing
+        isCmdReadOnly = isCommandReadonly infoMap request
+    keys <- case CMD.keysForRequest infoMap request of
+        Nothing -> throwIO $ UnsupportedClusterCommandException request
+        Just [] -> throwIO $ UnsupportedClusterCommandException request
+        Just k -> return k
+    let shards = nub $ mapMaybe ((flip IntMap.lookup shardMap) . fromEnum . keyToSlot) (fromMaybe keys mek)
+    node <- case (shards, connReadOnly) of
+        ([],_) -> throwIO $ MissingNodeException request
+        ([Shard master _], False) ->
+            return master
+        ([Shard master []], True) ->
+            return master
+        ([Shard master (slave: _)], True) ->
+            if isCmdReadOnly
+                then return slave
+                else return master
+        _ -> throwIO $ CrossSlotException2 request
+    maybe (throwIO $ MissingNodeException request) return (HM.lookup (nodeId node) nodeConns)
+    where
+        isCommandReadonly :: CMD.InfoMap -> [B.ByteString] -> Bool
+        isCommandReadonly (CMD.InfoMap iMap) (command: _) =
+            let
+                info = HM.lookup (map toLower $ Char8.unpack command) iMap
+            in maybe False (CMD.ReadOnly `elem`) (CMD.flags <$> info)
+        isCommandReadonly _ _ = False
 allMasterNodes :: Connection -> ShardMap -> Maybe [NodeConnection]
 allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
     mapM (flip HM.lookup nodeConns . nodeId) onlyMasterNodes
   where
     onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
+
+requestForResponse :: CompletedRequest -> [B.ByteString]   
+requestForResponse (CompletedRequest _ r _) = r
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection ctx lastRecvRef _) requests = do
@@ -476,6 +532,11 @@ hasLocked action =
   [ Handler $ \exc@BlockedIndefinitelyOnMVar -> throwIO exc
   ]
 
+hasLocked' :: String -> IO a -> IO a
+hasLocked' msg action =
+    action `catches`
+    [ Handler $ \exc@BlockedIndefinitelyOnMVar -> sayString ("[MVar]: " ++ msg) >> throwIO exc
+    ]
 
 requestMasterNodes :: Connection -> [B.ByteString] -> IO [Reply]
 requestMasterNodes conn req = do

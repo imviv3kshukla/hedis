@@ -242,7 +242,11 @@ connectCluster bootstrapConnInfo = do
           return clusterConn
 
 shardMapFromClusterSlotsResponse :: ClusterSlotsResponse -> IO ShardMap
-shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries where
+shardMapFromClusterSlotsResponse a@ClusterSlotsResponse{..} = do 
+    print $ "Cluster Slot Resoponse: " <> show a 
+    v <- ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries
+    print $ "shard map computed: " <> show v
+    return v where
     mkShardMap :: ClusterSlotsResponseEntry -> IO (IntMap.IntMap Shard) -> IO (IntMap.IntMap Shard)
     mkShardMap ClusterSlotsResponseEntry{..} accumulator = do
         accumulated <- accumulator

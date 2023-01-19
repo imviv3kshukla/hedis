@@ -222,7 +222,7 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         -- heavy perf issue. but still should be evaluated and figured out with complete rewrite.
         resps <- concat <$> mapM (\(resp, (cc, r)) -> case resp of
                                         Right v -> return v
-                                        Left (_ :: SomeException) ->  executeRequests (getRandomConnection cc) r
+                                        Left (_ :: SomeException) -> executeRequests (getRandomConnection cc) r
                       ) (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
         when (any (moved . rawResponse) resps) (refreshShardMapVar "locked refreshing due to moved responses")
@@ -248,6 +248,7 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
     retry :: Int -> CompletedRequest -> IO CompletedRequest
     retry retryCount resp@(CompletedRequest index request thisReply) = do
+        print $ "inside retried: " <> show request <> " with respo: " <> show thisReply
         retryReply <- case thisReply of
             (Error errString) | B.isPrefixOf "MOVED" errString -> do
                 shardMap <- hasLocked "reading shard map in retry MOVED" $ readMVar shardMapVar
@@ -300,8 +301,8 @@ nodeConnectionForCommand (Connection nodeConns _ _ infoMap connReadOnly) (ShardM
         isCmdReadOnly = isCommandReadonly infoMap request
     keys <- case CMD.keysForRequest infoMap request of
         Nothing -> throwIO $ UnsupportedClusterCommandException request
-        Just [] -> throwIO $ UnsupportedClusterCommandException request
         Just k -> return k
+    print $ "keys computed: " <> show keys <> " for request: " <> show request 
     let shards = nub $ mapMaybe ((flip IntMap.lookup shardMap) . fromEnum . keyToSlot) (fromMaybe keys mek)
     node <- case (shards, connReadOnly) of
         ([],_) -> throwIO $ MissingNodeException request

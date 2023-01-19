@@ -126,7 +126,7 @@ requestPipelined refreshAction conn@(Connection _ pipelineVar shardMapVar _) nex
 
 
 
-data PendingRequest = PendingRequest Int [B.ByteString]
+data PendingRequest = PendingRequest Int [B.ByteString] deriving (Show)
 data CompletedRequest = CompletedRequest Int [B.ByteString] Reply
 
 rawRequest :: PendingRequest -> [B.ByteString]
@@ -170,11 +170,14 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         nodeConn <- nodeConnectionForCommand conn shardMap request
         return (nodeConn, [PendingRequest index request])
     executeRequests :: NodeConnection -> [PendingRequest] -> IO [CompletedRequest]
-    executeRequests nodeConn nodeRequests = do
+    executeRequests nodeConn@(NodeConnection _ _ nodeId') nodeRequests = do
+        print $ "hedis:executeRequests sending the request: " <> show nodeRequests <> " to nodeId: " <> show nodeId'
         replies <- requestNode nodeConn $ map rawRequest nodeRequests
+        print $ "hedis:executeRequests replies: " <> show replies
         return $ map (\(PendingRequest i r, rep) -> CompletedRequest i r rep) (zip nodeRequests replies)
     retry :: Int -> CompletedRequest -> IO CompletedRequest
     retry retryCount resp@(CompletedRequest index request thisReply) = do
+        print $ "hedis:retry thisReply: " <> show request <> " with respo: " <> show thisReply
         retryReply <- case thisReply of
             (Error errString) | B.isPrefixOf "MOVED" errString -> do
                 shardMap <- hasLocked "reading shard map in retry MOVED" $ readMVar shardMapVar
@@ -191,6 +194,7 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
                             rawResponse <$> retry (retryCount + 1) resp
                         _ -> throwIO $ MissingNodeException (requestForResponse resp)
             _ -> return thisReply
+        print $ "hedis:retry retryReply: " <> show request <> " with respo: " <> show retryReply
         return (CompletedRequest index request retryReply)
     refreshShardMapVar :: String -> IO ()
     refreshShardMapVar msg = hasLocked msg $ modifyMVar_ shardMapVar (const refreshShardmapAction)
@@ -227,7 +231,10 @@ nodeConnectionForCommand (Connection nodeConns _ _ infoMap) (ShardMap shardMap) 
     keys <- case CMD.keysForRequest infoMap request of
         Nothing -> throwIO $ UnsupportedClusterCommandException request
         Just k -> return k
+    print $ "hedis:nodeConnectionForCommand keys computed: " <> show keys <> " for request: " <> show request <> " with keyslots for each: " <> show (keyToSlot <$> keys)
+    print $ "hedis:nodeConnectionForCommand shardMap " <> show shardMap
     let shards = nub $ mapMaybe ((flip IntMap.lookup shardMap) . fromEnum . keyToSlot) (fromMaybe keys mek)
+    print $ "hedis:nodeConnectionForCommand hashSlot " <> show shards
     node <- case shards of
         [] -> throwIO $ MissingNodeException request
         [Shard master _] -> return master

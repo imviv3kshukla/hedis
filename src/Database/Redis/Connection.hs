@@ -205,7 +205,12 @@ connectCluster bootstrapConnInfo = do
             return $ ClusteredConnection shardMapVar pool
 
 shardMapFromClusterSlotsResponse :: ClusterSlotsResponse -> IO ShardMap
-shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries where
+shardMapFromClusterSlotsResponse a@ClusterSlotsResponse{..} = do
+    print $ "hedis:shardMapFromClusterSlotsResponse Cluster Slot Resoponse: " <> show a 
+    v <- ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries
+    print $ "hedis:shardMapFromClusterSlotsResponse shard map computed: " <> show v
+    return v 
+    where
     mkShardMap :: ClusterSlotsResponseEntry -> IO (IntMap.IntMap Shard) -> IO (IntMap.IntMap Shard)
     mkShardMap ClusterSlotsResponseEntry{..} accumulator = do
         accumulated <- accumulator
